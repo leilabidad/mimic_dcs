@@ -1,8 +1,7 @@
 # mimic_dcs
 
 
-'''
-
+```
 mimic_dcs/
 ├─ data/
 │  ├─ images/               # chest xray .png/.jpg (paths stored in csv)
@@ -23,4 +22,4 @@ mimic_dcs/
 └─ README.md
 
 
-'''
+```
