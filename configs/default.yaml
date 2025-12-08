@@ -1,0 +1,11 @@
+image_model: swin_base_patch4_window7_224
+image_out_dim: 512
+tabular_cols: ['age','heart_rate','systolic_bp']
+batch_size: 16
+lr: 1e-4
+epochs: 10
+dcs:
+  w1: 0.4
+  w2: 0.4
+  w3: 0.2
+tau: 0.6
