@@ -1,11 +1,22 @@
-image_model: swin_base_patch4_window7_224
-image_out_dim: 512
-tabular_cols: ['age','heart_rate','systolic_bp']
-batch_size: 16
-lr: 1e-4
-epochs: 10
-dcs:
-  w1: 0.4
-  w2: 0.4
-  w3: 0.2
-tau: 0.6
+dataset:
+  image_dir: "./data/images"
+  clinical_csv: "./data/clinical.csv"
+  image_size: 224
+  batch_size: 8
+
+training:
+  lr: 1e-4
+  epochs: 5
+  mixed_precision: true
+  device: "cuda"
+
+model:
+  image_backbone: "swin_base_patch4_window7_224"
+  tabular_hidden: 128
+  notes_model: "TheBloke/Llama-3-1-70B-GPTQ"
+  freeze_backbone: true
+  dcs_weights:
+    w1: 0.4
+    w2: 0.3
+    w3: 0.3
+  qc_threshold: 0.75

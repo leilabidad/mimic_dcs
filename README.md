@@ -2,24 +2,28 @@
 
 
 ```
+
 mimic_dcs/
 ├─ data/
-│  ├─ images/               # chest xray .png/.jpg (paths stored in csv)
-│  └─ clinical.csv          # patient_id, age, labs..., note_text, label(s)
+│   ├─ images/               # Chest X-ray images (.png/.jpg)
+│   └─ clinical.csv          # patient_id, age, labs..., note_text, label(s)
 ├─ configs/
-│  └─ default.yaml
+│   └─ default.yaml
 ├─ src/
-│  ├─ dataset.py
-│  ├─ models.py
-│  ├─ trainer.py
-│  ├─ inference.py
-│  ├─ metrics.py
-│  └─ utils.py
+│   ├─ dataset.py
+│   ├─ models.py
+│   ├─ lrm.py
+│   ├─ dcs.py
+│   ├─ trainer.py
+│   ├─ inference.py
+│   ├─ utils.py
+│   └─ metrics.py
 ├─ scripts/
-│  ├─ preprocess_mimic.sh
-│  └─ run_train.sh
+│   ├─ preprocess_mimic.sh
+│   └─ run_train.sh
 ├─ experiments/
 └─ README.md
+
 
 
 ```

@@ -1,87 +1,97 @@
+"""
+Trainer script that trains ImageAgent and TabularAgent, uses NotesAgent (LLM) in frozen mode,
+and uses DCSSystem (aggregator + LRM) as post-hoc for computing Rf.
+
+Training objective:
+ - supervise agents (image/tabular) with BCE on their own Cm outputs (aux losses)
+ - supervise final Rf against label (main loss)
+ - NotesAgent (LLM) is frozen for efficiency (acts as reasoning agent)
+"""
+
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from models import ImageEncoder, TabularEncoder, NotesEncoder, Aggregator, HeadClassifier, LRM
-from dataset import MIMICMultiModalDataset
-import numpy as np
-from sklearn.metrics import roc_auc_score, accuracy_score
+import yaml
+import os
 
-class DCSModule:
-    def __init__(self, w1=0.4, w2=0.4, w3=0.2):
-        self.w1 = w1; self.w2 = w2; self.w3 = w3
-    def compute(self, cm, sc):
-        # cm: confidence [0,1], sc: [0,1]
-        return self.w1*cm + self.w2*sc + self.w3*(cm*sc)
+from src.dataset import MIMICDataset
+from src.models import ImageAgent, TabularAgent, NotesAgent
+from src.dcs import DCSSystem
 
-def train_epoch(device, models, optimizers, loader, notes_encoder, dcs_module, tau=0.6):
-    image_enc, tab_enc, aggregator, head_cls, lrm = models
-    image_enc.train(); tab_enc.train(); aggregator.train(); head_cls.train(); lrm.train()
+cfg = yaml.safe_load(open("configs/default.yaml"))
+device = torch.device(cfg['training']['device'])
 
-    losses = []
-    for batch in loader:
-        imgs = batch['image'].to(device)
-        tabs = batch['tabular'].to(device)
-        texts = batch['text']
-        labels = batch['label'].to(device)
+# Data
+dataset = MIMICDataset(cfg['dataset']['clinical_csv'], cfg['dataset']['image_dir'], cfg['dataset']['image_size'])
+loader = DataLoader(dataset, batch_size=cfg['dataset']['batch_size'], shuffle=True, num_workers=4)
 
-        img_feat = image_enc(imgs)
-        tab_feat = tab_enc(tabs)
-        note_feat = notes_encoder.encode(texts)  # tensor on device
-        if note_feat.device != device: note_feat = note_feat.to(device)
+# Agents and DCS system
+img_agent = ImageAgent().to(device)
+tab_agent = TabularAgent(input_dim=dataset[0]['tabular'].shape[0], hidden_dim=cfg['model']['tabular_hidden']).to(device)
+notes_agent = NotesAgent(cfg['model']['notes_model'])  # keep on device_map auto; we will not update its weights
+dcs = DCSSystem(img_dim=1024, tab_dim=128, note_dim=4096,
+                proj_dim=512, w1=cfg['model']['dcs_weights']['w1'],
+                w2=cfg['model']['dcs_weights']['w2'], w3=cfg['model']['dcs_weights']['w3'],
+                qc_threshold=cfg['model']['qc_threshold'], device=device).to(device)
 
-        evidence = aggregator(img_feat, tab_feat, note_feat)
-        logits = head_cls(evidence)
-        probs = F.softmax(logits, dim=1)[:,1]  # positive class prob = Cm
-        cm = probs.detach()   # baseline confidence
+# Freeze notes agent parameters (LLM)
+for p in notes_agent.parameters():
+    p.requires_grad = False
 
-        sc = lrm(evidence)    # consistency score in [0,1]
+# Optimizer: train image and tabular agent parameters only
+opt_params = list(img_agent.backbone.parameters()) + list(img_agent.classifier.parameters()) + list(tab_agent.mlp.parameters()) + list(dcs.parameters())
+optimizer = torch.optim.AdamW(opt_params, lr=cfg['training']['lr'])
+scaler = torch.cuda.amp.GradScaler(enabled=cfg['training']['mixed_precision'])
 
-        rf = dcs_module.compute(cm, sc)   # final composed score (tensor)
+# Loss functions
+bce = torch.nn.BCELoss()
 
-        # Loss: standard CE on backbone + optional regularizer to align rf with label
-        ce = F.cross_entropy(logits, labels)
-        # we can add a small loss to push rf toward 1 for positive class, 0 for negative
-        rf_target = labels.float()
-        rf_loss = F.mse_loss(rf, rf_target)
+save_dir = "experiments/checkpoints"
+os.makedirs(save_dir, exist_ok=True)
 
-        loss = ce + 0.5*rf_loss
+for epoch in range(cfg['training']['epochs']):
+    img_agent.train()
+    tab_agent.train()
+    total_loss = 0.0
+    for i, batch in enumerate(loader):
+        image = batch['image'].to(device)
+        tabular = batch['tabular'].to(device)
+        note_texts = batch['note_text']
+        label = batch['label'].to(device).unsqueeze(1)
 
-        # backward
-        for opt in optimizers: opt.zero_grad()
-        loss.backward()
-        for opt in optimizers: opt.step()
+        optimizer.zero_grad()
+        with torch.cuda.amp.autocast(enabled=cfg['training']['mixed_precision']):
+            # Agent forward
+            img_feat, Cm_img = img_agent(image)           # Cm_img: [B,1]
+            tab_feat, Cm_tab = tab_agent(tabular)        # Cm_tab: [B,1]
+            note_feat, Cm_note = notes_agent(note_texts, device)  # Cm_note: [B,1] (note: nodes may be on different device_map)
 
-        losses.append(loss.item())
-    return np.mean(losses)
+            # DCS forward (aggregator + LRM + final Rf)
+            Rf, qc_flag, explain = dcs(img_feat, tab_feat, note_feat, Cm_img, Cm_tab, Cm_note)
 
-def evaluate(device, models, loader, notes_encoder, dcs_module, tau=0.6):
-    image_enc, tab_enc, aggregator, head_cls, lrm = models
-    image_enc.eval(); tab_enc.eval(); aggregator.eval(); head_cls.eval(); lrm.eval()
+            # Losses:
+            # 1) agent-level auxiliary losses (encourage agents to make good predictions)
+            loss_img = bce(Cm_img, label)
+            loss_tab = bce(Cm_tab, label)
+            # 2) final Rf loss (main objective)
+            loss_rf = bce(Rf, label)
+            # Weighted sum
+            loss = 0.5 * loss_rf + 0.25 * loss_img + 0.25 * loss_tab
 
-    all_labels=[]; all_cm=[]; all_rf=[]
-    with torch.no_grad():
-        for batch in loader:
-            imgs = batch['image'].to(device)
-            tabs = batch['tabular'].to(device)
-            texts = batch['text']
-            labels = batch['label'].to(device)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
-            img_feat = image_enc(imgs)
-            tab_feat = tab_enc(tabs)
-            note_feat = notes_encoder.encode(texts)
-            if note_feat.device != device: note_feat = note_feat.to(device)
+        total_loss += loss.item()
 
-            evidence = aggregator(img_feat, tab_feat, note_feat)
-            logits = head_cls(evidence)
-            probs = F.softmax(logits, dim=1)[:,1]
-            cm = probs
-            sc = lrm(evidence)
-            rf = dcs_module.compute(cm, sc)
+    avg_loss = total_loss / len(loader)
+    print(f"Epoch {epoch} finished. Avg Loss: {avg_loss:.4f}")
 
-            all_labels.extend(labels.cpu().numpy().tolist())
-            all_cm.extend(cm.cpu().numpy().tolist())
-            all_rf.extend(rf.cpu().numpy().tolist())
-
-    auc_cm = roc_auc_score(all_labels, all_cm)
-    auc_rf = roc_auc_score(all_labels, all_rf)
-    return {'auc_cm': auc_cm, 'auc_rf': auc_rf}
+    # Save checkpoint (lightweight: save image/tabular/dcs weights)
+    ckpt = {
+        'epoch': epoch,
+        'img_agent': img_agent.state_dict(),
+        'tab_agent': tab_agent.state_dict(),
+        'dcs': dcs.state_dict(),
+        'optimizer': optimizer.state_dict()
+    }
+    torch.save(ckpt, os.path.join(save_dir, f"ckpt_epoch_{epoch}.pt"))
