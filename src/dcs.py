@@ -1,62 +1,98 @@
 """
-DCS module integrates:
- - per-agent confidences (Cm_img, Cm_tab, Cm_note)
- - aggregator joint_embedding, attention maps, importance
- - LRM outputs (Sc + explain)
-Then computes final Rf and QC flag.
+DCS agent implemented as pure Python + NumPy functions.
+This file intentionally avoids torch so DCS remains a post-hoc, framework-agnostic module.
+It consumes agent confidences and a joint_embedding (if available) and produces:
+ - Rf: reliability score
+ - QC flag: boolean decision
+ - explanation: structured diagnostic info
 """
 
-import torch
-import torch.nn as nn
-from src.lrm import LocalReasoningModule
-from src.aggregator import CrossModalAggregator
+import numpy as np
+from typing import Dict, Any, List, Optional
 
-class DCSSystem(nn.Module):
-    def __init__(self, img_dim=1024, tab_dim=128, note_dim=4096, proj_dim=512, 
-                 w1=0.4, w2=0.3, w3=0.3, qc_threshold=0.75, device='cuda'):
-        super().__init__()
-        self.device = device
-        self.aggregator = CrossModalAggregator(img_dim=img_dim, tab_dim=tab_dim, note_dim=note_dim, proj_dim=proj_dim).to(device)
-        self.lrm = LocalReasoningModule(proj_dim=proj_dim).to(device)
-        self.w1 = w1
-        self.w2 = w2
-        self.w3 = w3
+def _safe_to_numpy(x):
+    """Convert various tensor/array-like inputs to 1D numpy float array"""
+    if x is None:
+        return np.array([])
+    if hasattr(x, "detach"):
+        try:
+            return x.detach().cpu().numpy().reshape(-1)
+        except Exception:
+            pass
+    if hasattr(x, "numpy"):
+        return x.numpy().reshape(-1)
+    return np.array(x).reshape(-1)
+
+class DCSAgent:
+    """Dynamic Consistency Scoring Agent (post-hoc)"""
+    def __init__(self, w_img=0.4, w_lab=0.3, w_note=0.3, qc_threshold=0.75, multiplicative=0.1):
+        self.w_img = w_img
+        self.w_lab = w_lab
+        self.w_note = w_note
         self.qc_threshold = qc_threshold
+        self.multiplicative = multiplicative
 
-    def forward(self, img_feat, tab_feat, note_feat, Cm_img, Cm_tab, Cm_note):
+    def compute_sc_from_joint(self, joint_embedding: Optional[np.ndarray]) -> np.ndarray:
+        """Lightweight consistency proxy from joint embedding: normalized variance -> lower variance => higher consistency"""
+        if joint_embedding is None or joint_embedding.size == 0:
+            return np.array([0.5])
+        # compute inverse normalized std as consistency: higher -> more consistent
+        std = np.std(joint_embedding, axis=1)
+        # normalize to [0,1] by dividing with (max_std + eps)
+        max_std = np.max(std) + 1e-6
+        sc = 1.0 - (std / max_std)
+        return sc.reshape(-1, 1)  # shape [B,1]
+
+    def combine(self, Cm_img, Cm_lab, Cm_note, joint_embedding: Optional[np.ndarray] = None) -> Dict[str, Any]:
         """
         Inputs:
-          img_feat, tab_feat, note_feat: per-agent features
-          Cm_img, Cm_tab, Cm_note: per-agent confidences (all tensors shaped [B,1])
-        Outputs:
-          Rf: final reliability score [B,1]
-          qc_flag: boolean tensor [B,1]
-          explain: dict with LRM explain outputs + agent confidences + aggregator importance/attn
+          Cm_*: array-like or torch-like shape [B,1] or [B]
+          joint_embedding: optional numpy array [B, dim]
+        Returns:
+          dict with keys: Rf (numpy [B,1]), qc_flag (list[bool]), explain (dict)
         """
-        # Aggregate cross-modal information
-        joint_embedding, attention_maps, importance = self.aggregator(img_feat, tab_feat, note_feat)
-        # LRM computes consistency Sc and explanation
-        Sc, explain_lrm = self.lrm(joint_embedding, attention_maps=attention_maps, importance=importance)
-        # Combine confidences (weighted + multiplicative interactions)
-        # Ensure Cm_* and Sc are same dtype/device
-        Cm_img = Cm_img.to(self.device)
-        Cm_tab = Cm_tab.to(self.device)
-        Cm_note = Cm_note.to(self.device)
-        Sc = Sc.to(self.device)
-        Rf = self.w1 * Cm_img + self.w2 * Cm_tab + self.w3 * Cm_note + 0.1 * (Cm_img * Cm_tab * Cm_note) + 0.05 * (Cm_img * Sc)
-        qc_flag = (Rf < self.qc_threshold)
-        # Build explain dict
+        c_img = _safe_to_numpy(Cm_img)
+        c_lab = _safe_to_numpy(Cm_lab)
+        c_note = _safe_to_numpy(Cm_note)
+        # Ensure shapes
+        if c_img.ndim == 0:
+            c_img = np.array([c_img])
+        if c_lab.ndim == 0:
+            c_lab = np.array([c_lab])
+        if c_note.ndim == 0:
+            c_note = np.array([c_note])
+        # reshape to (B,)
+        c_img = c_img.reshape(-1)
+        c_lab = c_lab.reshape(-1)
+        c_note = c_note.reshape(-1)
+        B = max(len(c_img), len(c_lab), len(c_note))
+        # broadcast smaller arrays
+        def _broadcast(a):
+            if len(a) == 1 and B > 1:
+                return np.full((B,), a[0])
+            return a
+        c_img = _broadcast(c_img)
+        c_lab = _broadcast(c_lab)
+        c_note = _broadcast(c_note)
+
+        # compute Sc from joint embedding
+        Sc = self.compute_sc_from_joint(joint_embedding)  # [B,1]
+        Sc = Sc.reshape(-1)
+
+        # final Rf combining weights + multiplicative interaction
+        Rf = (self.w_img * c_img) + (self.w_lab * c_lab) + (self.w_note * c_note) + \
+             self.multiplicative * (c_img * c_lab * c_note) + 0.05 * (c_img * Sc)
+
+        # clip to [0,1]
+        Rf = np.clip(Rf, 0.0, 1.0)
+
+        qc_flag = (Rf < self.qc_threshold).tolist()
         explain = {
-            'agent_confidences': {
-                'Cm_img': Cm_img.detach().cpu().tolist(),
-                'Cm_tab': Cm_tab.detach().cpu().tolist(),
-                'Cm_note': Cm_note.detach().cpu().tolist(),
-            },
-            'Sc': Sc.detach().cpu().tolist(),
-            'Rf': Rf.detach().cpu().tolist(),
-            'qc_flag': qc_flag.detach().cpu().tolist(),
-            'aggregator_importance': importance.detach().cpu().tolist(),
+            'Cm_img': c_img.tolist(),
+            'Cm_lab': c_lab.tolist(),
+            'Cm_note': c_note.tolist(),
+            'Sc': Sc.tolist(),
+            'Rf': Rf.tolist(),
+            'qc_flag': qc_flag
         }
-        # merge LRM explainables
-        explain.update({'lrm_explain': explain_lrm})
-        return Rf, qc_flag, explain
+        return {'Rf': Rf.reshape(-1, 1), 'qc_flag': qc_flag, 'explain': explain}

@@ -1,22 +1,32 @@
+# Default configuration for mimic_dcs
 dataset:
   image_dir: "./data/images"
   clinical_csv: "./data/clinical.csv"
   image_size: 224
   batch_size: 8
+  tabular_cols: []  # If empty, will infer from CSV automatically
 
 training:
   lr: 1e-4
   epochs: 5
   mixed_precision: true
-  device: "cuda"
+  device: "cuda"   # or "cpu"
 
 model:
   image_backbone: "swin_base_patch4_window7_224"
   tabular_hidden: 128
-  notes_model: "TheBloke/Llama-3-1-70B-GPTQ"
-  freeze_backbone: true
+  notes_model: "TheBloke/Llama-3-1-70B-GPTQ"  # change to smaller model if needed
+  freeze_notes_model: true
   dcs_weights:
-    w1: 0.4
-    w2: 0.3
-    w3: 0.3
+    w_img: 0.4
+    w_lab: 0.3
+    w_note: 0.3
   qc_threshold: 0.75
+
+paths:
+  checkpoints: "experiments/checkpoints"
+  explain_out: "experiments/explain_outputs"
+
+misc:
+  seed: 42
+  num_workers: 4
